@@ -1,1 +1,146 @@
+name: Build Android APK
+on:
+  push:
+  workflow_dispatch:
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Create Source Code Automatically
+        run: |
+          mkdir -p app/src/main/java/com/example/autocallblocker
+          
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="自動拒接助手"
+                  android:theme="@style/Theme.MaterialComponents.DayNight.DarkActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AutoRejectService"
+                      android:permission="android.permission.BIND_SCREENING_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.telecom.CallScreeningService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/autocallblocker/AutoRejectService.kt
+          package com.example.autocallblocker
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.ContactsContract
+          import android.telecom.Call
+          import android.telecom.CallScreeningService
+          class AutoRejectService : CallScreeningService() {
+              override fun onScreenCall(callDetails: Call.Details) {
+                  if (callDetails.callDirection != Call.Details.DIRECTION_INCOMING) return
+                  val cleanNumber = (callDetails.handle?.schemeSpecificPart ?: "").replace(Regex("[\\s-]"), "")
+                  val prefs = getSharedPreferences("BlockerPrefs", Context.MODE_PRIVATE)
+                  val blockPrivate = prefs.getBoolean("block_private", true)
+                  val blacklist = prefs.getStringSet("blacklist", emptySet()) ?: emptySet()
+                  var shouldReject = false
+                  if (cleanNumber.isEmpty() && blockPrivate) {
+                      shouldReject = true
+                  } else if (blacklist.any { blocked -> blocked.isNotEmpty() && cleanNumber.endsWith(blocked) }) {
+                      shouldReject = true
+                  }
+                  if (shouldReject) {
+                      val response = CallResponse.Builder().setDisallowCall(true).setRejectCall(true).setSilenceCall(true).setSkipNotification(true).build()
+                      respondToCall(callDetails, response)
+                  } else {
+                      respondToCall(callDetails, CallResponse.Builder().setDisallowCall(false).build())
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/autocallblocker/MainActivity.kt
+          package com.example.autocallblocker
+          import android.Manifest
+          import android.app.role.RoleManager
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          class MainActivity : AppCompatActivity() {
+              private val roleLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {}
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 48, 48, 48) }
+                  val btnGrantRole = Button(this).apply {
+                      text = "1. 點擊啟用自動拒接權限 (必選)"
+                      setOnClickListener {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                              val rm = getSystemService(Context.ROLE_SERVICE) as RoleManager
+                              if (rm.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING) && !rm.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)) {
+                                  roleLauncher.launch(rm.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING))
+                              }
+                          }
+                      }
+                  }
+                  val prefs = getSharedPreferences("BlockerPrefs", Context.MODE_PRIVATE)
+                  val inputNumber = EditText(this).apply { hint = "輸入要自動掛斷的號碼" }
+                  val listView = ListView(this)
+                  val blacklist = prefs.getStringSet("blacklist", mutableSetOf())!!.toMutableList()
+                  val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, blacklist)
+                  listView.adapter = adapter
+                  val btnAdd = Button(this).apply {
+                      text = "新增至黑名單"
+                      setOnClickListener {
+                          val num = inputNumber.text.toString().replace(Regex("[\\s-]"), "")
+                          if (num.isNotEmpty() && !blacklist.contains(num)) {
+                              blacklist.add(0, num)
+                              prefs.edit().putStringSet("blacklist", blacklist.toSet()).apply()
+                              adapter.notifyDataSetChanged()
+                              inputNumber.text.clear()
+                          }
+                      }
+                  }
+                  layout.addView(btnGrantRole)
+                  layout.addView(inputNumber)
+                  layout.addView(btnAdd)
+                  layout.addView(TextView(this).apply { text = "\n黑名單列表：" })
+                  layout.addView(listView)
+                  setContentView(layout)
+              }
+          }
+          EOF
+      - name: Build Debug APK
+        run: |
+          gradle wrapper
+          chmod +x gradlew
+          ./gradlew assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoCallBlocker-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
